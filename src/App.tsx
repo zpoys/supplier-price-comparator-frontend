@@ -37,7 +37,6 @@ import {
   useToast,
   Tooltip,
   SimpleGrid,
-  Select,
   Progress,
 } from "@chakra-ui/react";
 import {
@@ -211,6 +210,13 @@ const CFG: Record<
     crud: true,
   },
 };
+function parseSupplierProductCode(input?: string) {
+  if (input) {
+    return input.match(/(?:product|kodeproduk)=([^&]+)/)?.[1] || "UNKNOWN";
+  }
+  return undefined;
+}
+
 const title = (s: string) =>
   s.replace(/([A-Z])/g, " $1").replace(/^./, (x) => x.toUpperCase());
 const date = (v: any) =>
@@ -346,15 +352,43 @@ type MappingActions = {
 const MappingTable = memo(function MappingTable({
   rows,
   actions,
+  selectedRows,
+  onSelectionChange,
+  disabled,
 }: {
   rows: Row[];
   actions: { current: MappingActions };
+  selectedRows: string[];
+  onSelectionChange: (next: string[]) => void;
+  disabled: boolean;
 }) {
+  const getKey = (row: Row) =>
+    `${row.productCode}|${row.supplierCode}|${row.supplierProductCode}`;
+  const allSelected =
+    rows.length > 0 && rows.every((row) => selectedRows.includes(getKey(row)));
+
   return (
     <Box className="table-wrap">
       <table className="data-table">
         <thead>
           <tr>
+            <th>
+              <input
+                aria-label="Select all product suppliers"
+                type="checkbox"
+                checked={allSelected}
+                disabled={disabled || rows.length === 0}
+                onChange={(event) =>
+                  onSelectionChange(
+                    event.target.checked
+                      ? [...new Set([...selectedRows, ...rows.map(getKey)])]
+                      : selectedRows.filter(
+                          (key) => !rows.some((row) => getKey(row) === key),
+                        ),
+                  )
+                }
+              />
+            </th>
             <th>Product</th>
             <th>Supplier</th>
             <th>Supplier product code</th>
@@ -363,9 +397,22 @@ const MappingTable = memo(function MappingTable({
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr
-              key={`${row.productCode}|${row.supplierCode}|${row.supplierProductCode}`}
-            >
+            <tr key={getKey(row)}>
+              <td>
+                <input
+                  aria-label={`Select ${row.productCode} / ${row.supplierCode} / ${row.supplierProductCode}`}
+                  type="checkbox"
+                  checked={selectedRows.includes(getKey(row))}
+                  disabled={disabled}
+                  onChange={(event) =>
+                    onSelectionChange(
+                      event.target.checked
+                        ? [...new Set([...selectedRows, getKey(row)])]
+                        : selectedRows.filter((key) => key !== getKey(row)),
+                    )
+                  }
+                />
+              </td>
               <td>{row.productCode}</td>
               <td>{row.supplierCode}</td>
               <td>{row.supplierProductCode}</td>
@@ -414,6 +461,7 @@ export default function App() {
   const navigateSection = (section: Key) =>
     navigate(section === "dashboard" ? "/" : `/${section}/find`);
   const [rows, setRows] = useState<Row[]>([]),
+    [loadedLocation, setLoadedLocation] = useState(""),
     [filters, setFilters] = useState<Record<string, string>>({}),
     [options, setOptions] = useState<Record<string, Row[]>>({}),
     [loading, setLoading] = useState(false),
@@ -434,8 +482,7 @@ export default function App() {
     [bulkBusy, setBulkBusy] = useState(false),
     [importSource, setImportSource] = useState<"standard" | "otomax">(
       "standard",
-    ),
-    [importMode, setImportMode] = useState<"insert" | "update">("insert");
+    );
   const modal = useDisclosure(),
     detail = useDisclosure(),
     importModal = useDisclosure();
@@ -453,6 +500,10 @@ export default function App() {
   const dark = colorMode === "dark";
   const cfg = active === "dashboard" ? null : CFG[active];
   const formCfg = mappingMode ? CFG["product-suppliers"] : cfg;
+  // Avoid rendering the empty-state spacer for one frame while a newly
+  // selected section is waiting for its first request to start.
+  const currentLocation = `${location.pathname}${location.search}`;
+  const pageLoading = loading || (!!cfg && loadedLocation !== currentLocation);
   const notify = (t: string, d?: string, s: "success" | "error" = "success") =>
     toast({
       title: t,
@@ -467,25 +518,37 @@ export default function App() {
     {},
   );
 
+  // Ignore responses from previous routes/searches. Browser back/forward can
+  // otherwise let an older request overwrite the current Product Suppliers table.
+  const loadRequestRef = useRef(0);
   const load = useCallback(
     async (searchFilters: Record<string, string> = {}) => {
       if (!cfg) return;
+      const requestId = ++loadRequestRef.current;
+      const endpoint = cfg.endpoint;
+      const requestLocation = `${location.pathname}${location.search}`;
       setLoading(true);
       setError("");
       try {
-        setRows(
-          await request<Row[]>(
-            `/${cfg.endpoint}/find${queryString(searchFilters)}`,
-          ),
+        const data = await request<Row[]>(
+          `/${endpoint}/find${queryString(searchFilters)}`,
         );
+        if (requestId === loadRequestRef.current) {
+          setRows(Array.isArray(data) ? data : []);
+        }
       } catch (e) {
-        setRows([]);
-        setError((e as Error).message);
+        if (requestId === loadRequestRef.current) {
+          setRows([]);
+          setError((e as Error).message);
+        }
       } finally {
-        setLoading(false);
+        if (requestId === loadRequestRef.current) {
+          setLoading(false);
+          setLoadedLocation(requestLocation);
+        }
       }
     },
-    [cfg?.endpoint],
+    [cfg?.endpoint, location.pathname, location.search],
   );
 
   // URL is the source of truth: filters survive refresh and can be shared/bookmarked.
@@ -494,12 +557,17 @@ export default function App() {
     [location.search],
   );
   useEffect(() => {
+    // Invalidate any in-flight request before switching sections (including
+    // browser back/forward to the dashboard, where no replacement request runs).
+    loadRequestRef.current++;
+    setLoading(false);
+    setRows([]);
+    setError("");
     setFilters(routeFilters);
     setAppliedFilters(routeFilters);
     setSelectedRows([]);
 
     if (cfg) void load(routeFilters);
-    else setRows([]);
   }, [active, location.pathname, location.search]);
 
   const submitSearch = () => {
@@ -693,12 +761,38 @@ export default function App() {
       notify(editing ? "Data diperbarui" : "Data ditambahkan");
       modal.onClose();
 
+      if (isMapping && active === "product-suppliers") {
+        // Keep the Product Suppliers table in sync locally after a successful
+        // mutation. No list refetch / page reload is needed.
+        const previousKey = editing ? rowKey(editing) : null;
+        const nextRow = { ...(editing || {}), ...body };
+        const nextKey = `${nextRow.productCode}|${nextRow.supplierCode}|${nextRow.supplierProductCode}`;
+        setRows((current) => {
+          if (editing) {
+            return current.flatMap((row) => {
+              if (rowKey(row) !== previousKey) return [row];
+              return matchesProductSupplierFilters(nextRow, appliedFilters)
+                ? [nextRow]
+                : [];
+            });
+          }
+          if (!matchesProductSupplierFilters(nextRow, appliedFilters))
+            return current;
+          return current.some((row) => rowKey(row) === nextKey)
+            ? current.map((row) => (rowKey(row) === nextKey ? nextRow : row))
+            : [...current, nextRow];
+        });
+        setSelectedRows((current) =>
+          previousKey ? current.filter((key) => key !== previousKey) : current,
+        );
+      }
+
       if (isMapping) {
         const productCode = String(
           body.productCode || editing?.productCode || detailProduct?.code || "",
         ).trim();
 
-        if (productCode) {
+        if (productCode && active !== "product-suppliers") {
           try {
             setDetailRows(
               await request<Row[]>(
@@ -744,10 +838,17 @@ export default function App() {
         );
       else await post(`/${cfg!.endpoint}/delete/${encodeURIComponent(r.code)}`);
       notify("Data berhasil dihapus");
-      if (fromDetail && detailProduct)
+      if (fromDetail && detailProduct) {
         await openProductSuppliers(detailProduct);
-      else {
-        await load(appliedFilters);
+      } else {
+        if (active === "product-suppliers") {
+          setRows((current) => current.filter((row) => rowKey(row) !== key));
+          setSelectedRows((current) =>
+            current.filter((selected) => selected !== key),
+          );
+        } else {
+          await load(appliedFilters);
+        }
         await dashboard();
       }
     } catch (e) {
@@ -760,6 +861,22 @@ export default function App() {
     active === "product-suppliers"
       ? `${r.productCode}|${r.supplierCode}|${r.supplierProductCode}`
       : String(r.code ?? "");
+
+  // Mirror the Product Suppliers API's filter syntax for optimistic inserts
+  // and updates so a locally-created row is only shown when it matches search.
+  const matchesProductSupplierFilters = (
+    row: Row,
+    searchFilters: Record<string, string>,
+  ) =>
+    Object.entries(searchFilters).every(([field, raw]) => {
+      const filter = String(raw || "").trim();
+      if (!filter) return true;
+      const value = String(row[field] ?? "");
+      if (filter.startsWith("!")) return !value.includes(filter.slice(1));
+      if (filter.startsWith("%") && filter.endsWith("%") && filter.length > 2)
+        return value.includes(filter.slice(1, -1));
+      return value === filter;
+    });
 
   // The ref stays stable, while its callbacks always point to the latest state.
   // This lets MappingTable skip renders caused only by typing in the filters.
@@ -845,6 +962,7 @@ export default function App() {
 
   const importExcel = async (file?: File) => {
     if (!file || !cfg) return;
+    // Both Excel and Otomax imports are insert-only.
     setBulkBusy(true);
     try {
       const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
@@ -894,6 +1012,10 @@ export default function App() {
           const value = source[field.name];
           row[field.name] = value == null ? "" : String(value).trim();
         }
+        if (importSource === "otomax" && active === "product-suppliers") {
+          row.supplierProductCode =
+            parseSupplierProductCode(row.supplierProductCode) ?? "";
+        }
         for (const field of cfg.fields) {
           const value = row[field.name];
           if (field.required && !value)
@@ -935,56 +1057,55 @@ export default function App() {
         return row;
       });
 
-      const modeLabel =
-        importMode === "insert"
-          ? "Insert (data baru)"
-          : "Update Bulk (perbarui berdasarkan primary key)";
       if (
         !window.confirm(
-          `Import ${normalized.length} baris ke ${cfg.title} menggunakan ${importSource === "otomax" ? "format Otomax" : "format Excel biasa"} dengan mode ${modeLabel}?`,
+          `Import ${normalized.length} baris ke ${cfg.title} menggunakan ${importSource === "otomax" ? "format Otomax" : "format Excel biasa"} dengan mode Insert (data baru)?`,
         )
       )
         return;
 
       let succeeded = 0;
       const failures: string[] = [];
+      const successfulRows: Row[] = [];
       for (let i = 0; i < normalized.length; i++) {
         const row = normalized[i];
         try {
-          let result: unknown;
-          if (importMode === "insert") {
-            result = await post(
-              importSource === "otomax"
-                ? active === "products"
-                  ? "/products/create-otomax"
-                  : active === "product-suppliers"
-                    ? "/product-suppliers/create-otomax"
-                    : `/${cfg.endpoint}/create`
-                : `/${cfg.endpoint}/create`,
-              row,
-            );
-          } else if (active === "product-suppliers") {
-            result = await post(
-              `/product-suppliers/update/${encodeURIComponent(row.productCode)}/${encodeURIComponent(row.supplierCode)}/${encodeURIComponent(row.supplierProductCode)}`,
-              row,
-            );
-          } else {
-            result = await post(
-              `/${cfg.endpoint}/update/${encodeURIComponent(row.code)}`,
-              row,
-            );
-          }
-          if (importMode === "update" && !result)
-            throw new Error(
-              "Data dengan primary key tersebut tidak ditemukan.",
-            );
+          await post(
+            importSource === "otomax"
+              ? active === "products"
+                ? "/products/create"
+                : active === "product-suppliers"
+                  ? "/product-suppliers/create"
+                  : `/${cfg.endpoint}/create`
+              : `/${cfg.endpoint}/create`,
+            row,
+          );
           succeeded++;
+          successfulRows.push(row);
         } catch (e) {
           failures.push(`Baris ${i + 2}: ${(e as Error).message}`);
         }
       }
       setSelectedRows([]);
-      await load(appliedFilters);
+      if (active === "product-suppliers") {
+        setRows((current) => {
+          let next = [...current];
+          for (const importedRow of successfulRows) {
+            const key = `${importedRow.productCode}|${importedRow.supplierCode}|${importedRow.supplierProductCode}`;
+            const index = next.findIndex((row) => rowKey(row) === key);
+            if (!matchesProductSupplierFilters(importedRow, appliedFilters)) {
+              if (index >= 0) next.splice(index, 1);
+            } else if (index >= 0) {
+              next[index] = { ...next[index], ...importedRow };
+            } else {
+              next.push(importedRow);
+            }
+          }
+          return next;
+        });
+      } else {
+        await load(appliedFilters);
+      }
       await dashboard();
       if (failures.length)
         notify(
@@ -996,10 +1117,7 @@ export default function App() {
           "error",
         );
       else
-        notify(
-          "Import berhasil",
-          `${succeeded} baris berhasil ${importMode === "insert" ? "ditambahkan" : "diperbarui"}.`,
-        );
+        notify("Import berhasil", `${succeeded} baris berhasil ditambahkan.`);
     } catch (e) {
       notify("Import gagal", (e as Error).message, "error");
     } finally {
@@ -1021,16 +1139,34 @@ export default function App() {
     try {
       let succeeded = 0;
       const failures: string[] = [];
+      const deletedKeys = new Set<string>();
       for (const r of selected) {
         try {
-          await post(`/${cfg.endpoint}/delete/${encodeURIComponent(r.code)}`);
+          if (active === "product-suppliers") {
+            await post(
+              `/product-suppliers/delete/${encodeURIComponent(r.productCode)}/${encodeURIComponent(r.supplierCode)}/${encodeURIComponent(r.supplierProductCode)}`,
+            );
+          } else {
+            await post(`/${cfg.endpoint}/delete/${encodeURIComponent(r.code)}`);
+          }
           succeeded++;
+          deletedKeys.add(rowKey(r));
         } catch (e) {
-          failures.push(`${r.code}: ${(e as Error).message}`);
+          const identifier =
+            active === "product-suppliers"
+              ? `${r.productCode}/${r.supplierCode}/${r.supplierProductCode}`
+              : String(r.code);
+          failures.push(`${identifier}: ${(e as Error).message}`);
         }
       }
       setSelectedRows([]);
-      await load(appliedFilters);
+      if (active === "product-suppliers") {
+        setRows((current) =>
+          current.filter((row) => !deletedKeys.has(rowKey(row))),
+        );
+      } else {
+        await load(appliedFilters);
+      }
       await dashboard();
       if (failures.length)
         notify(
@@ -1491,7 +1627,7 @@ export default function App() {
                           Data records
                         </Text>
                         <Text color="gray.500" fontSize="xs">
-                          {loading
+                          {pageLoading
                             ? "Loading..."
                             : `${rows.length} records found`}
                         </Text>
@@ -1503,7 +1639,7 @@ export default function App() {
                         {error}
                       </Alert>
                     )}
-                    {loading ? (
+                    {pageLoading ? (
                       <Stack p={5}>
                         <Skeleton h="20px" />
                         <SkeletonText noOfLines={5} />
@@ -1524,7 +1660,13 @@ export default function App() {
                         </Text>
                       </VStack>
                     ) : (
-                      <MappingTable rows={rows} actions={mappingActionsRef} />
+                      <MappingTable
+                        rows={rows}
+                        actions={mappingActionsRef}
+                        selectedRows={selectedRows}
+                        onSelectionChange={setSelectedRows}
+                        disabled={bulkBusy}
+                      />
                     )}
                   </Box>
                 </>
@@ -1626,7 +1768,7 @@ export default function App() {
                           Data records
                         </Text>
                         <Text color="gray.500" fontSize="xs">
-                          {loading
+                          {pageLoading
                             ? "Loading..."
                             : `${rows.length} records found`}
                         </Text>
@@ -1639,7 +1781,7 @@ export default function App() {
                         {error}
                       </Alert>
                     )}
-                    {loading ? (
+                    {pageLoading ? (
                       <Stack p={5}>
                         <Skeleton h="20px" />
                         <SkeletonText noOfLines={5} />
@@ -1789,25 +1931,11 @@ export default function App() {
           <ModalCloseButton />
           <ModalBody>
             <Stack spacing={4}>
-              <FormControl>
-                <FormLabel>Mode import</FormLabel>
-                <Select
-                  value={importMode}
-                  onChange={(e) =>
-                    setImportMode(e.target.value as "insert" | "update")
-                  }
-                >
-                  <option value="insert">Insert — tambah data baru</option>
-                  <option value="update">
-                    Update Bulk — perbarui data yang sudah ada
-                  </option>
-                </Select>
-              </FormControl>
               <Alert status="info" rounded="md">
                 <AlertIcon />
-                {importMode === "update"
-                  ? "Update Bulk mencari data berdasarkan primary key. Baris yang tidak ditemukan akan gagal; tidak membuat data baru."
-                  : "Insert hanya menambahkan data baru. Data duplikat akan dilaporkan sebagai gagal."}
+                {
+                  "Import hanya menggunakan mode Insert. Data duplikat akan dilaporkan sebagai gagal."
+                }
               </Alert>
               <FormControl>
                 <FormLabel>Pilih file Excel (.xlsx / .xls)</FormLabel>
